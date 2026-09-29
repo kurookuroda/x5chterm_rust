@@ -1,8 +1,8 @@
 //! 対話TUI。Python版 tui/app.py・tui/screens.py に対応。
 //!
 //! メインメニュー→板一覧→スレ一覧→スレ読みの一本道に加えて、検索モーダル・
-//! キュー管理画面・履歴管理画面を実装している。Webhook個別送信・Export・
-//! 番号指定コマンド(w/e/E/mの数値プレフィックス)は範囲外。
+//! キュー管理画面・履歴管理画面・Webhook個別送信・番号指定コマンドを実装している。
+//! Export(`e`/`E`)は範囲外。
 //!
 //! ここでも他の章と同じ設計方針を貫いている: 「画面遷移の状態管理(純粋なロジック)」と
 //! 「実際の描画・キー入力(I/O)」をはっきり分ける。前者はターミナルなしでcargo testできる。
@@ -22,14 +22,19 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wra
 use ratatui::Terminal;
 
 use crate::browser::Browser;
+use crate::config;
 use crate::discord;
+use crate::fetch::Fetcher;
 use crate::history::{Manager, RecentThread};
 use crate::models::{Board, Category, Post, ThreadInfo};
 use crate::threads::HistoryStore;
 use crate::transfer::{self, Worker};
+use crate::webhook;
 
-const DEFAULT_STATUS: &str =
-    "j/k:移動 Enter:選択 b/Esc:戻る r:再読込 s:検索 t:キュー管理 H:履歴管理 m:送信予約 q:終了";
+const DEFAULT_STATUS: &str = "j/k:移動 Enter:選択 b/Esc:戻る r:再読込 s:検索 t:キュー管理 \
+H:履歴管理 m:送信予約 w/W:Webhook送信 0-9+Enter/コマンド:番号指定 q:終了";
+
+type Term = Terminal<CrosstermBackend<io::Stdout>>;
 
 /// MainMenuScreenの1行(Python版の _RecentEntry / _CategoryEntry に対応)。
 #[derive(Debug, Clone)]
@@ -76,6 +81,19 @@ impl Screen {
             Screen::ThreadPager { .. } | Screen::Search { .. } => None,
         }
     }
+
+    /// この画面が「番号入力→ジャンプ」をサポートするリスト画面かどうか。
+    /// Python版 IndexedListViewMixin を適用しているクラス群に対応。
+    fn supports_index_buffer(&self) -> bool {
+        matches!(
+            self,
+            Screen::MainMenu { .. }
+                | Screen::BoardList { .. }
+                | Screen::ThreadList { .. }
+                | Screen::QueueManage { .. }
+                | Screen::HistoryManage { .. }
+        )
+    }
 }
 
 /// 選択中カーソルを1つ動かす(負数で上、正数で下)。リストの端で折り返す。
@@ -98,9 +116,23 @@ pub fn scroll_pager(screen: &mut Screen, delta: isize) {
     }
 }
 
+/// 入力中の数字バッファ文字列を、画面の項目数に照らして有効なインデックスに解決する。
+/// Python版 IndexedListViewMixin._resolved_index() に対応する純粋関数。
+pub fn resolved_index(buffer: &str, item_count: usize) -> Option<usize> {
+    if buffer.is_empty() {
+        return None;
+    }
+    let idx: usize = buffer.parse().ok()?;
+    if idx < item_count {
+        Some(idx)
+    } else {
+        None
+    }
+}
+
 /// 「今選ばれている行を決定(Enter)した」結果、次に何をすべきかを表す。
 /// I/Oが要るケース(スレ一覧やレスの取得、削除)は、ここでは実行せずに呼び出し側へ委譲する
-/// —この分離のおかげで、activate_currentは純粋関数のままユニットテストできる。
+/// —この分離のおかげで、activate_at/activate_currentは純粋関数のままユニットテストできる。
 #[derive(Debug, Clone)]
 pub enum Action {
     None,
@@ -111,29 +143,43 @@ pub enum Action {
     DeleteHistoryEntry { board_url: String, dat_file: String },
 }
 
+/// ハイライト中の行(screen自身が持つselected)を対象に決定する。
 pub fn activate_current(screen: &Screen) -> Action {
+    let idx = match screen {
+        Screen::MainMenu { selected, .. }
+        | Screen::BoardList { selected, .. }
+        | Screen::ThreadList { selected, .. }
+        | Screen::QueueManage { selected, .. }
+        | Screen::HistoryManage { selected, .. } => *selected,
+        Screen::ThreadPager { .. } | Screen::Search { .. } => return Action::None,
+    };
+    activate_at(screen, idx)
+}
+
+/// 明示的に指定したインデックスの行を対象に決定する。番号入力+Enterのジャンプ用。
+pub fn activate_at(screen: &Screen, idx: usize) -> Action {
     match screen {
-        Screen::MainMenu { entries, selected } => match entries.get(*selected) {
+        Screen::MainMenu { entries, .. } => match entries.get(idx) {
             Some(MenuEntry::Recent(t)) => Action::LoadPostsForThread(t.clone()),
             Some(MenuEntry::Category(c)) => Action::PushBoardList(c.clone()),
             None => Action::None,
         },
-        Screen::BoardList { category, selected } => match category.boards.get(*selected) {
+        Screen::BoardList { category, .. } => match category.boards.get(idx) {
             Some(b) => Action::LoadThreadsForBoard(b.clone()),
             None => Action::None,
         },
-        Screen::ThreadList { threads, selected, .. } => match threads.get(*selected) {
+        Screen::ThreadList { threads, .. } => match threads.get(idx) {
             Some(t) => Action::LoadPostsForThread(t.clone()),
             None => Action::None,
         },
-        Screen::QueueManage { tasks, selected } => {
-            if tasks.is_empty() {
-                Action::None
+        Screen::QueueManage { tasks, .. } => {
+            if idx < tasks.len() {
+                Action::DeleteQueueAt(idx)
             } else {
-                Action::DeleteQueueAt(*selected)
+                Action::None
             }
         }
-        Screen::HistoryManage { items, selected } => match items.get(*selected) {
+        Screen::HistoryManage { items, .. } => match items.get(idx) {
             Some(rt) => Action::DeleteHistoryEntry {
                 board_url: rt.thread_info.board_url.clone(),
                 dat_file: rt.thread_info.dat_file.clone(),
@@ -149,6 +195,8 @@ pub fn activate_current(screen: &Screen) -> Action {
 pub struct AppState {
     pub stack: Vec<Screen>,
     pub status: String,
+    /// 番号入力中のバッファ(Python版 IndexedListViewMixin._index_buffer に対応)。
+    pub index_buffer: String,
 }
 
 impl AppState {
@@ -197,9 +245,10 @@ fn menu_list_lines(screen: &Screen) -> (Vec<ListItem<'static>>, usize) {
         Screen::MainMenu { entries, selected } => {
             let items = entries
                 .iter()
-                .map(|e| match e {
-                    MenuEntry::Recent(t) => ListItem::new(format!("★ {}", t.title)),
-                    MenuEntry::Category(c) => ListItem::new(c.title.clone()),
+                .enumerate()
+                .map(|(i, e)| match e {
+                    MenuEntry::Recent(t) => ListItem::new(format!("{i:>2} ★ {}", t.title)),
+                    MenuEntry::Category(c) => ListItem::new(format!("{i:>2}  {}", c.title)),
                 })
                 .collect();
             (items, *selected)
@@ -208,16 +257,21 @@ fn menu_list_lines(screen: &Screen) -> (Vec<ListItem<'static>>, usize) {
             let items = category
                 .boards
                 .iter()
-                .map(|b| ListItem::new(b.title.clone()))
+                .enumerate()
+                .map(|(i, b)| ListItem::new(format!("{i:>2} {}", b.title)))
                 .collect();
             (items, *selected)
         }
         Screen::ThreadList { threads, selected, .. } => {
             let items = threads
                 .iter()
-                .map(|t| {
+                .enumerate()
+                .map(|(i, t)| {
                     let mark = if t.has_new() { "● " } else { "  " };
-                    ListItem::new(format!("{mark}{} ({}) 勢い{:.1}", t.title, t.count, t.ikioi))
+                    ListItem::new(format!(
+                        "{i:>2} {mark}{} ({}) 勢い{:.1}",
+                        t.title, t.count, t.ikioi
+                    ))
                 })
                 .collect();
             (items, *selected)
@@ -226,7 +280,11 @@ fn menu_list_lines(screen: &Screen) -> (Vec<ListItem<'static>>, usize) {
             let items = if tasks.is_empty() {
                 vec![ListItem::new("(待機中のタスクはありません)")]
             } else {
-                tasks.iter().map(|t| ListItem::new(t.title.clone())).collect()
+                tasks
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| ListItem::new(format!("{i:>2} {}", t.title)))
+                    .collect()
             };
             (items, 0)
         }
@@ -236,9 +294,10 @@ fn menu_list_lines(screen: &Screen) -> (Vec<ListItem<'static>>, usize) {
             } else {
                 items
                     .iter()
-                    .map(|rt| {
+                    .enumerate()
+                    .map(|(i, rt)| {
                         ListItem::new(format!(
-                            "{} (Read: {})",
+                            "{i:>2} {} (Read: {})",
                             rt.thread_info.title, rt.thread_info.last_read
                         ))
                     })
@@ -309,8 +368,169 @@ fn draw(frame: &mut ratatui::Frame, state: &AppState) {
         }
     }
 
-    let footer = Paragraph::new(state.status.as_str());
+    // 番号入力中は「> 12」のように先頭に表示する(Python版の#index-statusラベル相当)。
+    let footer_text = if state.index_buffer.is_empty() {
+        state.status.clone()
+    } else {
+        format!("> {}  {}", state.index_buffer, state.status)
+    };
+    let footer = Paragraph::new(footer_text);
     frame.render_widget(footer, chunks[1]);
+}
+
+/// 未読/単発のレスをWebhookへ送信し、状態表示用の短い文字列を返す。
+/// ThreadList/ThreadPagerどちらの'w'/'W'ハンドラからも(ハイライト対象でも番号指定でも)共通で使う。
+async fn send_via_webhook(fetcher: &Fetcher, urls_file: &str, posts: &[Post]) -> String {
+    let urls = webhook::load_webhook_urls(urls_file);
+    if urls.is_empty() {
+        return "Webhook URLが設定されていません".to_string();
+    }
+    if posts.is_empty() {
+        return "新着なし".to_string();
+    }
+
+    let failures = webhook::broadcast_posts(fetcher, &urls, posts, webhook::MESSAGE_INTERVAL).await;
+    let total_failed: usize = failures.values().map(std::vec::Vec::len).sum();
+
+    if total_failed > 0 {
+        format!("送信完了(一部失敗: {total_failed}件)")
+    } else {
+        format!("{}件送信しました", posts.len())
+    }
+}
+
+/// 指定スレッドの未読レスをWebhookへ送信する(ThreadListの'w'。ハイライト対象・番号指定対象共通)。
+async fn webhook_send_for(
+    t: &ThreadInfo,
+    browser: &Browser<Arc<Manager>>,
+    history: &Manager,
+    fetcher: &Fetcher,
+    urls_file: &str,
+    terminal: &mut Term,
+    state: &mut AppState,
+) -> io::Result<()> {
+    let mut t = t.clone();
+    state.status = "取得中...".to_string();
+    terminal.draw(|f| draw(f, state))?;
+
+    match browser.get_thread_data(&mut t).await {
+        Ok(posts) => {
+            let last_read = history.get_last_read(&t.board_url, &t.dat_file).await;
+            let unread: Vec<Post> = posts.into_iter().filter(|p| p.num > last_read).collect();
+            state.status = "送信中...".to_string();
+            terminal.draw(|f| draw(f, state))?;
+            state.status = send_via_webhook(fetcher, urls_file, &unread).await;
+        }
+        Err(e) => state.status = format!("取得エラー: {e}"),
+    }
+    Ok(())
+}
+
+/// 指定スレッドをDiscord転送キューへ予約する(ThreadListの'm')。
+async fn enqueue_for(
+    t: &ThreadInfo,
+    worker: &Worker,
+    discord_mgr: &discord::Manager,
+    history: &Manager,
+    state: &mut AppState,
+) {
+    if !discord_mgr.enabled() {
+        state.status = "Discordトークン/チャンネルIDが未設定です".to_string();
+        return;
+    }
+    worker
+        .enqueue(transfer::Task {
+            title: t.title.clone(),
+            board_url: t.board_url.clone(),
+            dat_file: t.dat_file.clone(),
+        })
+        .await;
+    history.add_new_thread(&t.title, &t.board_url, &t.dat_file).await;
+    state.status = format!("キューに追加: {}", t.title);
+}
+
+/// 指定スレッドの閲覧履歴を削除する(ThreadListの'H'。第6章のManager::delete_threadを再利用)。
+async fn delete_history_for(t: &ThreadInfo, history: &Manager, state: &mut AppState) {
+    let ok = history.delete_thread(&t.board_url, &t.dat_file).await;
+    state.status = if ok {
+        format!("履歴を削除しました: {}", t.title)
+    } else {
+        "削除対象の履歴がありません".to_string()
+    };
+}
+
+/// Enterで確定したActionを実行する。ハイライト対象(activate_current)・番号指定
+/// (activate_at)のどちらから来たActionも、ここで同じ処理を通る。
+async fn handle_action(
+    action: Action,
+    browser: &Browser<Arc<Manager>>,
+    history: &Manager,
+    worker: &Worker,
+    terminal: &mut Term,
+    state: &mut AppState,
+) -> io::Result<()> {
+    match action {
+        Action::None => {}
+        Action::PushBoardList(category) => {
+            state.push(Screen::BoardList { category, selected: 0 });
+        }
+        Action::LoadThreadsForBoard(mut board) => {
+            state.status = "読み込み中...".to_string();
+            terminal.draw(|f| draw(f, state))?;
+            match browser.get_threads(&mut board, false).await {
+                Ok(threads) => {
+                    state.push(Screen::ThreadList {
+                        title: board.title.clone(),
+                        threads,
+                        selected: 0,
+                    });
+                    state.status = DEFAULT_STATUS.to_string();
+                }
+                Err(e) => state.status = format!("取得エラー: {e}"),
+            }
+        }
+        Action::LoadPostsForThread(mut thread) => {
+            state.status = "読み込み中...".to_string();
+            terminal.draw(|f| draw(f, state))?;
+            match browser.get_thread_data(&mut thread).await {
+                Ok(posts) => {
+                    state.push(Screen::ThreadPager { thread, posts, scroll: 0 });
+                    state.status = DEFAULT_STATUS.to_string();
+                }
+                Err(e) => state.status = format!("取得エラー: {e}"),
+            }
+        }
+        Action::DeleteQueueAt(idx) => {
+            let deleted = worker.delete_at(idx).await;
+            state.status = match &deleted {
+                Some(t) => format!("削除しました: {}", t.title),
+                None => DEFAULT_STATUS.to_string(),
+            };
+            let tasks = worker.queue_list().await;
+            if let Screen::QueueManage { tasks: slot, selected } = state.top_mut() {
+                *slot = tasks;
+                if !slot.is_empty() && *selected >= slot.len() {
+                    *selected = slot.len() - 1;
+                }
+            }
+        }
+        Action::DeleteHistoryEntry { board_url, dat_file } => {
+            let ok = history.delete_thread(&board_url, &dat_file).await;
+            state.status = if ok {
+                "履歴を削除しました".to_string()
+            } else {
+                "削除に失敗しました".to_string()
+            };
+            let items = history.get_recent_threads().await;
+            if let Screen::HistoryManage { items: slot, selected } = state.top_mut() {
+                *slot = items;
+                if !slot.is_empty() && *selected >= slot.len() {
+                    *selected = slot.len() - 1;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// TUI本体を起動する。Python版 X5chApp.run() 相当。
@@ -331,10 +551,17 @@ pub async fn run(
 
     worker.start();
 
+    // Webhook個別送信('w'/'W')用。DiscordのBot APIとは別経路なので、
+    // Worker/Browserとは独立したFetcherを1本持たせる(cli.rsのwebhook-sendコマンドと同じ構成)。
+    let cfg = config::load_config();
+    let webhook_fetcher = Fetcher::new(cfg.user_agent.clone());
+    let webhook_urls_file = cfg.webhook_urls_file.clone();
+
     let main_menu = load_main_menu(&browser, &history).await;
     let mut state = AppState {
         stack: vec![main_menu],
         status: DEFAULT_STATUS.to_string(),
+        index_buffer: String::new(),
     };
 
     loop {
@@ -390,6 +617,80 @@ pub async fn run(
             continue;
         }
 
+        // --- 番号入力(IndexedListViewMixin相当) ---
+        // 1. 数字キーはバッファに積むだけ(対応画面のみ)。
+        if let KeyCode::Char(c) = key.code {
+            if c.is_ascii_digit() && state.top().supports_index_buffer() {
+                state.index_buffer.push(c);
+                continue;
+            }
+        }
+
+        // 2. バッファに何か入っている間は、Backspace/Enter/コマンドキーを
+        //    「番号指定」として先に処理する。それ以外のキーはバッファを破棄した上で
+        //    通常の処理(下のmatch)に流す — Python版の「未対応キーはバッファ破棄のうえ
+        //    通常処理へ」という挙動と同じ。
+        if !state.index_buffer.is_empty() {
+            match key.code {
+                KeyCode::Backspace => {
+                    state.index_buffer.pop();
+                    continue;
+                }
+                KeyCode::Enter => {
+                    let idx = resolved_index(&state.index_buffer, state.top().item_count());
+                    state.index_buffer.clear();
+                    match idx {
+                        Some(i) => {
+                            let action = activate_at(state.top(), i);
+                            handle_action(action, &browser, &history, &worker, &mut terminal, &mut state)
+                                .await?;
+                        }
+                        None => state.status = "無効な番号です".to_string(),
+                    }
+                    continue;
+                }
+                KeyCode::Char(c @ ('w' | 'm' | 'H')) if matches!(state.top(), Screen::ThreadList { .. }) => {
+                    let idx = resolved_index(&state.index_buffer, state.top().item_count());
+                    state.index_buffer.clear();
+                    let Some(i) = idx else {
+                        state.status = "無効な番号です".to_string();
+                        continue;
+                    };
+                    let Screen::ThreadList { threads, .. } = state.top() else {
+                        continue;
+                    };
+                    let Some(t) = threads.get(i).cloned() else {
+                        continue;
+                    };
+                    match c {
+                        'w' => {
+                            webhook_send_for(
+                                &t,
+                                &browser,
+                                &history,
+                                &webhook_fetcher,
+                                &webhook_urls_file,
+                                &mut terminal,
+                                &mut state,
+                            )
+                            .await?;
+                        }
+                        'm' => enqueue_for(&t, &worker, &discord_mgr, &history, &mut state).await,
+                        'H' => delete_history_for(&t, &history, &mut state).await,
+                        _ => unreachable!(),
+                    }
+                    continue;
+                }
+                KeyCode::Esc => {
+                    // バッファは破棄しつつ、戻る動作自体は下の通常処理に委ねる(Python版と同じ)。
+                    state.index_buffer.clear();
+                }
+                _ => {
+                    state.index_buffer.clear();
+                }
+            }
+        }
+
         match key.code {
             KeyCode::Char('q') if matches!(state.top(), Screen::MainMenu { .. }) => break,
             KeyCode::Char('j') | KeyCode::Down => move_selection(state.top_mut(), 1),
@@ -413,88 +714,67 @@ pub async fn run(
                 let items = history.get_recent_threads().await;
                 state.push(Screen::HistoryManage { items, selected: 0 });
             }
-            // ThreadList上で'm'を押すと、ハイライト中のスレッドをDiscord転送キューへ
-            // 予約する(Python版 ThreadListScreen.action_enqueue に対応)。
-            KeyCode::Char('m') => {
+            // ThreadList上でハイライト中のスレッドに対する'm'/'w'/'H'
+            // (番号指定なしの場合。番号指定版は上のバッファ処理ブロックで済んでいる)。
+            KeyCode::Char('m') if matches!(state.top(), Screen::ThreadList { .. }) => {
                 if let Screen::ThreadList { threads, selected, .. } = state.top() {
                     if let Some(t) = threads.get(*selected).cloned() {
-                        if !discord_mgr.enabled() {
-                            state.status = "Discordトークン/チャンネルIDが未設定です".to_string();
-                        } else {
-                            worker
-                                .enqueue(transfer::Task {
-                                    title: t.title.clone(),
-                                    board_url: t.board_url.clone(),
-                                    dat_file: t.dat_file.clone(),
-                                })
-                                .await;
-                            history.add_new_thread(&t.title, &t.board_url, &t.dat_file).await;
-                            state.status = format!("キューに追加: {}", t.title);
-                        }
+                        enqueue_for(&t, &worker, &discord_mgr, &history, &mut state).await;
                     }
                 }
             }
-            KeyCode::Enter => match activate_current(state.top()) {
-                Action::None => {}
-                Action::PushBoardList(category) => {
-                    state.push(Screen::BoardList { category, selected: 0 });
+            KeyCode::Char('w') if matches!(state.top(), Screen::ThreadList { .. }) => {
+                if let Screen::ThreadList { threads, selected, .. } = state.top() {
+                    if let Some(t) = threads.get(*selected).cloned() {
+                        webhook_send_for(
+                            &t,
+                            &browser,
+                            &history,
+                            &webhook_fetcher,
+                            &webhook_urls_file,
+                            &mut terminal,
+                            &mut state,
+                        )
+                        .await?;
+                    }
                 }
-                Action::LoadThreadsForBoard(mut board) => {
-                    state.status = "読み込み中...".to_string();
+            }
+            KeyCode::Char('H') if matches!(state.top(), Screen::ThreadList { .. }) => {
+                if let Screen::ThreadList { threads, selected, .. } = state.top() {
+                    if let Some(t) = threads.get(*selected).cloned() {
+                        delete_history_for(&t, &history, &mut state).await;
+                    }
+                }
+            }
+            // ThreadPager上での'w'(未読送信)/'W'(現在位置のみ送信)。
+            // Rust版はscrollがそのまま「今見ているレスのインデックス」なので、
+            // Python版のような可視位置の逆算(_update_current_res)が不要になっている。
+            KeyCode::Char('w') if matches!(state.top(), Screen::ThreadPager { .. }) => {
+                if let Screen::ThreadPager { thread, posts, .. } = state.top() {
+                    let unread: Vec<Post> = posts
+                        .iter()
+                        .filter(|p| p.num > thread.last_read)
+                        .cloned()
+                        .collect();
+                    state.status = "送信中...".to_string();
                     terminal.draw(|f| draw(f, &state))?;
-                    match browser.get_threads(&mut board, false).await {
-                        Ok(threads) => {
-                            state.push(Screen::ThreadList {
-                                title: board.title.clone(),
-                                threads,
-                                selected: 0,
-                            });
-                            state.status = DEFAULT_STATUS.to_string();
-                        }
-                        Err(e) => state.status = format!("取得エラー: {e}"),
+                    state.status = send_via_webhook(&webhook_fetcher, &webhook_urls_file, &unread).await;
+                }
+            }
+            KeyCode::Char('W') => {
+                if let Screen::ThreadPager { posts, scroll, .. } = state.top() {
+                    if let Some(post) = posts.get(*scroll).cloned() {
+                        state.status = "送信中...".to_string();
+                        terminal.draw(|f| draw(f, &state))?;
+                        state.status =
+                            send_via_webhook(&webhook_fetcher, &webhook_urls_file, &[post]).await;
                     }
                 }
-                Action::LoadPostsForThread(mut thread) => {
-                    state.status = "読み込み中...".to_string();
-                    terminal.draw(|f| draw(f, &state))?;
-                    match browser.get_thread_data(&mut thread).await {
-                        Ok(posts) => {
-                            state.push(Screen::ThreadPager { thread, posts, scroll: 0 });
-                            state.status = DEFAULT_STATUS.to_string();
-                        }
-                        Err(e) => state.status = format!("取得エラー: {e}"),
-                    }
-                }
-                Action::DeleteQueueAt(idx) => {
-                    let deleted = worker.delete_at(idx).await;
-                    state.status = match &deleted {
-                        Some(t) => format!("削除しました: {}", t.title),
-                        None => DEFAULT_STATUS.to_string(),
-                    };
-                    let tasks = worker.queue_list().await;
-                    if let Screen::QueueManage { tasks: slot, selected } = state.top_mut() {
-                        *slot = tasks;
-                        if !slot.is_empty() && *selected >= slot.len() {
-                            *selected = slot.len() - 1;
-                        }
-                    }
-                }
-                Action::DeleteHistoryEntry { board_url, dat_file } => {
-                    let ok = history.delete_thread(&board_url, &dat_file).await;
-                    state.status = if ok {
-                        "履歴を削除しました".to_string()
-                    } else {
-                        "削除に失敗しました".to_string()
-                    };
-                    let items = history.get_recent_threads().await;
-                    if let Screen::HistoryManage { items: slot, selected } = state.top_mut() {
-                        *slot = items;
-                        if !slot.is_empty() && *selected >= slot.len() {
-                            *selected = slot.len() - 1;
-                        }
-                    }
-                }
-            },
+            }
+            KeyCode::Enter => {
+                let action = activate_current(state.top());
+                handle_action(action, &browser, &history, &worker, &mut terminal, &mut state).await?;
+            }
             KeyCode::Char('J') => scroll_pager(state.top_mut(), 1),
             KeyCode::Char('K') => scroll_pager(state.top_mut(), -1),
             _ => {}
@@ -562,8 +842,18 @@ mod tests {
     }
 
     #[test]
+    fn activate_at_ignores_screens_own_selected_field() {
+        // selected=0のままでも、activate_atに2を渡せば末尾のカテゴリ「趣味」が対象になる。
+        let screen = sample_menu();
+        match activate_at(&screen, 2) {
+            Action::PushBoardList(cat) => assert_eq!(cat.title, "趣味"),
+            other => panic!("expected PushBoardList, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn app_state_pop_refuses_to_close_last_screen() {
-        let mut state = AppState { stack: vec![sample_menu()], status: String::new() };
+        let mut state = AppState { stack: vec![sample_menu()], status: String::new(), index_buffer: String::new() };
         assert!(!state.pop());
         assert_eq!(state.stack.len(), 1);
 
@@ -643,5 +933,73 @@ mod tests {
         move_selection(&mut screen, 1);
         let Screen::Search { input } = screen else { unreachable!() };
         assert_eq!(input, "ab");
+    }
+
+    #[test]
+    fn resolved_index_parses_valid_in_range_number() {
+        assert_eq!(resolved_index("2", 5), Some(2));
+    }
+
+    #[test]
+    fn resolved_index_rejects_out_of_range_or_empty_or_non_numeric() {
+        assert_eq!(resolved_index("5", 5), None); // 0..item_count-1が範囲
+        assert_eq!(resolved_index("", 5), None);
+        assert_eq!(resolved_index("abc", 5), None);
+    }
+
+    #[test]
+    fn supports_index_buffer_excludes_pager_and_search() {
+        assert!(sample_menu().supports_index_buffer());
+        assert!(!Screen::Search { input: String::new() }.supports_index_buffer());
+        let pager = Screen::ThreadPager { thread: ThreadInfo::new("1.dat"), posts: vec![], scroll: 0 };
+        assert!(!pager.supports_index_buffer());
+    }
+
+    #[tokio::test]
+    async fn send_via_webhook_reports_missing_url_config() {
+        let fetcher = Fetcher::new("x5ch_rs/test");
+        let missing_path = "/tmp/x5ch_rs_no_such_webhook_urls_file.json";
+        let posts = vec![Post {
+            num: 1,
+            name: "名無し".to_string(),
+            date: String::new(),
+            message: "test".to_string(),
+        }];
+        let status = send_via_webhook(&fetcher, missing_path, &posts).await;
+        assert_eq!(status, "Webhook URLが設定されていません");
+    }
+
+    #[tokio::test]
+    async fn send_via_webhook_reports_no_new_posts() {
+        let fetcher = Fetcher::new("x5ch_rs/test");
+        let path = std::env::temp_dir().join(format!("x5ch_rs_test_wh_urls_{}.json", std::process::id()));
+        std::fs::write(&path, r#"["https://example.invalid/webhook"]"#).unwrap();
+
+        let status = send_via_webhook(&fetcher, path.to_str().unwrap(), &[]).await;
+        assert_eq!(status, "新着なし");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn delete_history_for_reports_success_and_failure() {
+        let path = std::env::temp_dir().join(format!("x5ch_rs_test_tui_history_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let history = Manager::new(&path);
+
+        let mut t = ThreadInfo::new("1.dat");
+        t.title = "テストスレ".to_string();
+        t.board_url = "https://egg.5ch.io/livejupiter/".to_string();
+        history.add_new_thread(&t.title, &t.board_url, &t.dat_file).await;
+
+        let mut state = AppState { stack: vec![sample_menu()], status: String::new(), index_buffer: String::new() };
+        delete_history_for(&t, &history, &mut state).await;
+        assert!(state.status.contains("削除しました"));
+
+        // 2回目は既に無いので失敗メッセージになるはず。
+        delete_history_for(&t, &history, &mut state).await;
+        assert_eq!(state.status, "削除対象の履歴がありません");
+
+        let _ = std::fs::remove_file(&path);
     }
 }
